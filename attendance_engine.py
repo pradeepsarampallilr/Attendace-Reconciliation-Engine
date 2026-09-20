@@ -13,7 +13,7 @@ from openpyxl.utils import get_column_letter # type: ignore
 
 
 # Output column names for attendance sheet and audit log.
-OUTPUT_COLUMNS = ["Employee Name","Employee id","Email","Shift Timings","Year","Month","Week","Checked In Date","Checked Out Date","# of hours in Office",]
+OUTPUT_COLUMNS = ["Employee Name","Employee id","Email","Shift Timings","Year","Month","Week","Checked In Date","Checked Out Date","# of hours in Office","Date","Daily Total Hours"]
 AUDIT_COLUMNS = ["Employee id", "Employee Name", "Issue", "Details", "Timestamp"]
 
 # Required columns in shift roster
@@ -55,7 +55,8 @@ class VisitRecord:
 
     def as_row(self) -> list:
         return [self.name,self.emp_code,self.email,self.shift_timing,self.year,
-        self.month_name,self.week_of_month,self.check_in,self.check_out,self.hours_in_office,]
+        self.month_name,self.week_of_month,self.check_in,self.check_out,self.hours_in_office,
+        self.check_in.date().isoformat(), None]
 
 @dataclass(slots=True)
 class AuditEntry:
@@ -322,12 +323,80 @@ class ReportWriter:
         attendance_df = pd.DataFrame([v.as_row() for v in visits], columns=OUTPUT_COLUMNS)
         audit_df = pd.DataFrame([a.as_row() for a in audit], columns=AUDIT_COLUMNS)
 
+        if not attendance_df.empty:
+            attendance_df["_employee_day_key"] = attendance_df.apply(
+                lambda row: (str(row["Employee id"]), row["Date"]), axis=1
+            )
+            attendance_df["Daily Total Hours"] = None
+            for key, group in attendance_df.groupby("_employee_day_key", sort=False, dropna=False):
+                total_hours = group["# of hours in Office"].sum()
+                first_row = group.index[0]
+                attendance_df.at[first_row, "Daily Total Hours"] = total_hours
+            attendance_df = attendance_df.drop(columns=["_employee_day_key"])
+
         with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
             attendance_df.to_excel(writer, sheet_name="Attendance", index=False)
             audit_df.to_excel(writer, sheet_name="Audit Log", index=False)
 
-            cls._style_sheet(writer.book["Attendance"], date_cols={8, 9})
+            attendance_sheet = writer.book["Attendance"]
+            cls._apply_daily_total_merges(attendance_sheet)
+            cls._style_sheet(attendance_sheet, date_cols={8, 9})
             cls._style_sheet(writer.book["Audit Log"], date_cols={5})
+
+    @classmethod
+    def _apply_daily_total_merges(cls, sheet) -> None:
+        emp_col = OUTPUT_COLUMNS.index("Employee id") + 1
+        date_col = OUTPUT_COLUMNS.index("Date") + 1
+        daily_total_col = OUTPUT_COLUMNS.index("Daily Total Hours") + 1
+
+        last_row = sheet.max_row
+        if last_row <= 1:
+            return
+
+        current_group = None
+        current_start = None
+
+        for row_idx in range(2, last_row + 1):
+            emp_value = sheet.cell(row=row_idx, column=emp_col).value
+            date_value = sheet.cell(row=row_idx, column=date_col).value
+            group_key = (str(emp_value), str(date_value)) if emp_value is not None and date_value is not None else None
+
+            if current_group is None:
+                current_group = group_key
+                current_start = row_idx
+                continue
+
+            if group_key == current_group:
+                continue
+
+            if current_start is not None:
+                current_end = row_idx - 1
+                if current_end >= current_start:
+                    for col_idx in [date_col, daily_total_col]:
+                        merged_range = f"{get_column_letter(col_idx)}{current_start}:{get_column_letter(col_idx)}{current_end}"
+                        if sheet.merged_cells.ranges:
+                            if merged_range not in [rng.coord for rng in sheet.merged_cells.ranges]:
+                                sheet.merge_cells(merged_range)
+                        else:
+                            sheet.merge_cells(merged_range)
+                        first_cell = sheet.cell(row=current_start, column=col_idx)
+                        first_cell.alignment = Alignment(horizontal="center", vertical="center")
+
+            current_group = group_key
+            current_start = row_idx
+
+        if current_start is not None:
+            current_end = last_row
+            if current_end >= current_start:
+                for col_idx in [date_col, daily_total_col]:
+                    merged_range = f"{get_column_letter(col_idx)}{current_start}:{get_column_letter(col_idx)}{current_end}"
+                    if sheet.merged_cells.ranges:
+                        if merged_range not in [rng.coord for rng in sheet.merged_cells.ranges]:
+                            sheet.merge_cells(merged_range)
+                    else:
+                        sheet.merge_cells(merged_range)
+                    first_cell = sheet.cell(row=current_start, column=col_idx)
+                    first_cell.alignment = Alignment(horizontal="center", vertical="center")
 
     @classmethod
     def _style_sheet(cls, sheet, date_cols: set[int]) -> None:
