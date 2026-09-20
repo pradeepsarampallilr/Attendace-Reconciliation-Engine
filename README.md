@@ -68,7 +68,7 @@ Contains one row per check-in and includes columns like:
 - Week
 - Checked In Date
 - Checked Out Date
-- # of hours in Office
+- No.of hours in Office
 
 ### Audit Log
 Contains rows that were skipped, dropped, or left unresolved, with details like:
