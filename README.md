@@ -9,6 +9,19 @@ It is designed for monthly door-access data where each row contains employee mov
 
 ---
 
+## Current Processing Rules
+
+- The current-month movement report is required. A previous-month movement report is optional.
+- When a previous-month report is supplied, only its final transaction date is loaded. Those events are placed into the employee swipe pools before the current-month events so a previous-month check-in can match a checkout recorded on the first day of the current month.
+- Previous-month events are used only for matching. Visits whose check-in belongs to the previous month are excluded from the current-month Attendance output, so their hours are not included in current-month totals.
+- Each check-in is paired with the earliest unused checkout that occurs after it, before the next check-in, on the same day or the following day, and within the configured maximum shift duration of 18 hours.
+- A missing checkout remains blank and is recorded in the Audit Log. An unused checkout is treated as an orphan checkout and is also recorded in the Audit Log.
+- For overnight shifts, a post-midnight check-in before the roster shift end belongs to the previous work date. For example, `2026-08-04 00:52` belongs to the `2026-08-03` shift for a `4:00 PM - 1:30 AM` roster schedule.
+- If a current report ends with a check-in that has no checkout and the employee has an overnight roster shift, the engine uses the next day’s roster shift-end time as the fallback checkout. For example, an August 31 check-in for a `4:30 PM - 1:30 AM` shift receives a fallback checkout of September 1 at `1:30 AM`.
+- The `Date` and `Daily Total Hours` columns are grouped by employee and work date. The daily hours are summed across all visits, written on the first row of the group, and visually merged across the group in Excel. Original visit rows are retained.
+
+---
+
 ## What the engine does
 
 The engine performs a pipeline of work:

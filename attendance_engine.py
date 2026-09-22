@@ -159,12 +159,43 @@ class AttendanceEngine:
         if self.previous_movement_path and current_dates:
             current_start = min(current_dates).date().replace(day=1)
             next_month = (current_start.replace(year=current_start.year + 1, month=1)if current_start.month == 12 else current_start.replace(month=current_start.month + 1))
-            visits = [visit for visit in visits if current_start <= visit.check_in.date() < next_month
-                or (visit.check_out is not None and current_start <= visit.check_out.date() < next_month)]
+            visits = [
+                visit
+                for visit in visits
+                if current_start <= visit.check_in.date() < next_month
+            ]
 
         self._enrich_with_roster(visits)
+        if current_dates:
+            self._fill_month_end_overnight_checkouts(visits, max(timestamp.date() for timestamp in current_dates))
         visits.sort(key=lambda v: (v.name.lower(), v.check_in))
         return visits, self.audit
+
+    def _fill_month_end_overnight_checkouts(
+        self, visits: list[VisitRecord], last_transaction_date: date
+    ) -> None:
+        for visit in visits:
+            if visit.check_in.date() != last_transaction_date or visit.check_out is not None:
+                continue
+
+            shift_start, shift_end = self._parse_shift_window(visit.shift_timing)
+            if shift_start is None or shift_end is None or shift_end >= shift_start:
+                continue
+
+            visit.check_out = datetime.combine(last_transaction_date + timedelta(days=1), shift_end)
+
+    @staticmethod
+    def _parse_shift_window(shift_timing: str) -> tuple[Optional[time], Optional[time]]:
+        parts = [part.strip() for part in shift_timing.split("-")]
+        if len(parts) != 2:
+            return None, None
+        try:
+            return (
+                datetime.strptime(parts[0], "%I:%M %p").time(),
+                datetime.strptime(parts[1], "%I:%M %p").time(),
+            )
+        except ValueError:
+            return None, None
 
     @staticmethod
     def _merge_event_pools(first: dict[str, tuple[str, list[datetime], list[datetime]]],
