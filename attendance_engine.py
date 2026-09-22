@@ -58,6 +58,7 @@ class VisitRecord:
         self.month_name,self.week_of_month,self.check_in,self.check_out,self.hours_in_office,
         self.check_in.date().isoformat(), None]
 
+# data structure for audit entry.
 @dataclass(slots=True)
 class AuditEntry:
     emp_code: str
@@ -69,7 +70,7 @@ class AuditEntry:
         return [self.emp_code, self.name, self.issue, self.detail, self.timestamp]
 
 
-# Parsing and normalization helpers
+# Parsing and normalization of employee id
 def normalize_id(value) -> str:
     # while reading excel numbers are converted to float, so we need to remove the decimal part if it is .0
     text = str(value).strip()
@@ -122,16 +123,13 @@ def clean_text(value) -> str:
 
 # core engine
 class AttendanceEngine:
+
+    #default constants
     HEADER_PROBE = "empcode" #the column name we look for to detect the header row in the movement report
     MAX_HEADER_SCAN_ROWS = 15 #how many rows to scan for the header row in the movement report
     MAX_SHIFT_HOURS = 18 #taken for the maximum number of hours allowed in a single check-in/check-out session
 
-    def __init__(
-        self,
-        movement_path: Path,
-        shift_path: Optional[Path] = None,
-        previous_movement_path: Optional[Path] = None,
-    ):
+    def __init__(self,movement_path: Path,shift_path: Optional[Path] = None,previous_movement_path: Optional[Path] = None,):
         self.movement_path = Path(movement_path)
         self.shift_path = Path(shift_path) if shift_path else None
         self.previous_movement_path = (Path(previous_movement_path) if previous_movement_path else None)
@@ -140,9 +138,12 @@ class AttendanceEngine:
         self._reported_missing_roster: set[str] = set()
 
     def run(self) -> tuple[list[VisitRecord], list[AuditEntry]]:
+        # if shift roster is present loading them into lookup
         if self.shift_path:
             self.shift_lookup = self._load_shift_roster(self.shift_path)
+        #from movement excel extracting header row and all other data.
         header, data = self._load_movement_table(self.movement_path)
+        #this makes a set of ins and outs
         events = self._extract_events(header, data)
         current_dates = [timestamp for _, (_, ins, outs) in events.items() for timestamp in (*ins, *outs)]
 
@@ -154,16 +155,14 @@ class AttendanceEngine:
 
         visits: list[VisitRecord] = []
         for emp_code, (name, ins, outs) in events.items():
+            # actual pairing occurs here checkin with checkout.
             visits.extend(self._reconcile_employee(emp_code, name, ins, outs))
 
         if self.previous_movement_path and current_dates:
             current_start = min(current_dates).date().replace(day=1)
+            #handled year change also
             next_month = (current_start.replace(year=current_start.year + 1, month=1)if current_start.month == 12 else current_start.replace(month=current_start.month + 1))
-            visits = [
-                visit
-                for visit in visits
-                if current_start <= visit.check_in.date() < next_month
-            ]
+            visits = [ visit for visit in visits if current_start <= visit.check_in.date() < next_month]
 
         self._enrich_with_roster(visits)
         if current_dates:
@@ -181,7 +180,6 @@ class AttendanceEngine:
             shift_start, shift_end = self._parse_shift_window(visit.shift_timing)
             if shift_start is None or shift_end is None or shift_end >= shift_start:
                 continue
-
             visit.check_out = datetime.combine(last_transaction_date + timedelta(days=1), shift_end)
 
     @staticmethod

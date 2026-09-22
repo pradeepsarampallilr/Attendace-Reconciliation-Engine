@@ -22,6 +22,175 @@ It is designed for monthly door-access data where each row contains employee mov
 
 ---
 
+## Developer Quick Recall
+
+Use this section as the short mental model for the whole codebase.
+
+### One-line purpose
+
+```text
+Raw movement file -> clean swipe events -> pair visits -> enrich roster data -> calculate work dates/totals -> write Excel + audit log
+```
+
+### Runtime order
+
+```text
+main()
+  1. Ask for current movement report
+  2. Ask for optional previous-month movement report
+  3. Ask for optional shift roster
+  4. Create AttendanceEngine
+  5. engine.run()
+  6. Ask for output filename
+  7. ReportWriter.write()
+```
+
+### Engine order
+
+```text
+AttendanceEngine.run()
+  -> load roster
+  -> load current movement table
+  -> extract current events
+  -> optionally load only the previous report's last transaction date
+  -> merge previous events before current events
+  -> reconcile each employee
+  -> remove previous-month visits from current-month output
+  -> enrich visits from roster
+  -> fill final-date overnight fallback checkouts
+  -> sort visits
+  -> return visits and audit entries
+```
+
+### The five most important methods
+
+| Method | Responsibility |
+|---|---|
+| `run()` | Coordinates the complete engine workflow. |
+| `_extract_events()` | Converts table rows into employee-wise check-in/check-out timestamp pools. |
+| `_reconcile_employee()` | Creates one `VisitRecord` for each check-in and consumes valid checkouts. |
+| `_find_checkout()` | Applies the actual checkout acceptance rules. |
+| `ReportWriter.write()` | Builds the output DataFrames, calculates daily totals, and writes the workbook. |
+
+### Data flow in one example
+
+```text
+Excel row: employee 156350, date 2026-08-03, In 16:10, Out 18:11
+    |
+    v
+datetime(2026, 8, 3, 16, 10) in the employee's `ins` set
+datetime(2026, 8, 3, 18, 11) in the employee's `outs` set
+    |
+    v
+_reconcile_employee() pairs the two timestamps
+    |
+    v
+VisitRecord(check_in=..., check_out=...)
+    |
+    v
+VisitRecord.hours_in_office -> 2.02
+    |
+    v
+ReportWriter writes the Attendance row
+```
+
+### Rules that decide the result
+
+1. Employee IDs are normalized before matching.
+2. Duplicate timestamps are removed because events are stored in sets.
+3. Check-ins and checkouts are sorted before reconciliation.
+4. Each check-in receives the earliest unused valid checkout.
+5. A checkout must be later than its check-in.
+6. A checkout must be before the employee's next check-in.
+7. A checkout may be on the same day or the next calendar day.
+8. A visit cannot exceed `MAX_SHIFT_HOURS` (currently 18 hours).
+9. Missing checkout: keep the visit, leave checkout/hours blank, and audit it.
+10. Unused checkout: exclude it from Attendance and audit it as an orphan.
+11. Previous-month events are matching context only; previous-month check-ins are not output in the current report.
+12. A final-date orphan check-in gets a roster-based checkout only for an overnight shift.
+
+### Overnight work-date rule
+
+For a roster shift such as `4:00 PM - 1:30 AM`:
+
+```text
+2026-08-03 16:10 -> work date 2026-08-03
+2026-08-04 00:52 -> work date 2026-08-03
+2026-08-04 15:42 -> work date 2026-08-04
+```
+
+`ReportWriter._work_date()` controls this reporting date. It does not change the original check-in timestamp.
+
+### Month-end fallback rule
+
+`_fill_month_end_overnight_checkouts()` runs after roster enrichment. It only considers a visit when:
+
+- the check-in is on the latest transaction date in the current report
+- the checkout is still missing
+- the roster shift parses successfully
+- the shift crosses midnight
+
+For `4:30 PM - 1:30 AM` on August 31, it creates a fallback checkout of September 1 at 1:30 AM. It does not fill missing checkouts on ordinary earlier dates or for day shifts.
+
+### Daily total and merge rule
+
+`ReportWriter.write()` groups by:
+
+```text
+Employee id + calculated work Date
+```
+
+It sums `# of hours in Office`, writes the sum on the first row of the group, leaves later total cells blank, and then merges the `Date` and `Daily Total Hours` cells vertically in the Excel view. Individual visit rows are not deleted.
+
+### Safe places to customize
+
+| Goal | Change point |
+|---|---|
+| Accept a different movement header | `HEADER_PROBE`, `_detect_header_row()`, or `find_col()` inside `_extract_events()` |
+| Allow longer visits | `AttendanceEngine.MAX_SHIFT_HOURS` |
+| Change checkout matching | `_find_checkout()` |
+| Change previous-month behavior | `run()` and `_extract_events(..., allowed_dates=...)` |
+| Change month-end fallback | `_fill_month_end_overnight_checkouts()` |
+| Change work-date grouping | `ReportWriter._work_date()` |
+| Change daily totals or merging | `ReportWriter.write()` and `_apply_daily_total_merges()` |
+| Add or rename output columns | `OUTPUT_COLUMNS` and `VisitRecord.as_row()` together |
+| Change Excel styling | `ReportWriter._style_sheet()` |
+
+### Changes to treat carefully
+
+- Changing `_find_checkout()` changes attendance results across the entire report.
+- Changing `MAX_SHIFT_HOURS` can create false matches between unrelated days.
+- Changing `OUTPUT_COLUMNS` without changing `VisitRecord.as_row()` causes misaligned output.
+- Changing the `Date` column affects daily totals and merge ranges.
+- The month-end fallback is an estimated checkout from the roster, not a real swipe.
+- Excel merged cells are presentation-only and may be inconvenient for later manual editing.
+- Google Sheets output is not implemented; the current writer creates `.xlsx` files.
+
+### Verification checklist
+
+After a code change:
+
+```bash
+source "/Users/psaram/Desktop/Excel parser/venv/bin/activate"
+python3 -m py_compile attendance_engine.py
+```
+
+Then test at least:
+
+- same-day check-in/check-out
+- overnight check-in/check-out
+- multiple visits on one work date
+- missing checkout
+- orphan checkout
+- previous-month final-day check-in with first-day checkout
+- final-date overnight check-in with no checkout
+- final-date day-shift check-in with no checkout
+- employee missing from roster
+
+When output looks wrong, inspect the `Audit Log` first. It explains why rows were skipped, left blank, or excluded.
+
+---
+
 ## What the engine does
 
 The engine performs a pipeline of work:
@@ -81,7 +250,9 @@ Contains one row per check-in and includes columns like:
 - Week
 - Checked In Date
 - Checked Out Date
-- No.of hours in Office
+- # of hours in Office
+- Date
+- Daily Total Hours
 
 ### Audit Log
 Contains rows that were skipped, dropped, or left unresolved, with details like:
@@ -401,8 +572,9 @@ python3 attendance_engine.py
 The script will ask for:
 
 1. path to the movement report (.xlsx or .csv)
-2. path to the shift roster file (optional)
-3. output file name (optional)
+2. path to the previous month's movement report (optional)
+3. path to the shift roster file (optional)
+4. output file name (optional)
 
 Then it generates the Excel report automatically.
 
