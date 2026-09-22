@@ -65,7 +65,6 @@ class AuditEntry:
     issue: str
     detail: str
     timestamp: Optional[datetime] = None
-
     def as_row(self) -> list:
         return [self.emp_code, self.name, self.issue, self.detail, self.timestamp]
 
@@ -80,6 +79,7 @@ def normalize_id(value) -> str:
     return digits or text
 
 
+# parsing date in the excel to python datetime
 def parse_date(value) -> Optional[date]:
     if value is None or (isinstance(value, float) and pd.isna(value)):
         return None
@@ -91,6 +91,7 @@ def parse_date(value) -> Optional[date]:
     return None if pd.isna(parsed) else parsed.date()
 
 
+#parsing the check in and out time to python format
 def parse_time(value) -> Optional[time]:
     if value is None or (isinstance(value, float) and pd.isna(value)):
         return None
@@ -110,6 +111,7 @@ def parse_time(value) -> Optional[time]:
     return None if pd.isna(parsed) else parsed.time()
 
 
+# strips every text to removes spaces.
 def clean_text(value) -> str:
     if value is None or (isinstance(value, float) and pd.isna(value)):
         return ""
@@ -239,18 +241,18 @@ class AttendanceEngine:
                 remaining_outs.remove(checkout)
             else:
                 self.audit.append(
-                    AuditEntry(emp_code, name, "No matching checkout",
+                    AuditEntry(emp_code, name, "Orphan checkin",
                         f"Check-in at {check_in:%Y-%m-%d %H:%M:%S} has no valid "
-                        f"checkout before the next check-in; left blank.",
-                        check_in,))
+                        f"checkout before the next check-in, so left blank.",check_in,))
             visits.append(VisitRecord(emp_code=emp_code, name=name,check_in=check_in, check_out=checkout))
 
+
+        # the check out which are not paired with any checkin are left so auditing all of them.
         for orphan in remaining_outs:
             self.audit.append(
                 AuditEntry(emp_code, name, "Orphan checkout",
                     f"Checkout at {orphan:%Y-%m-%d %H:%M:%S} has no preceding "
-                    f"check-in in this report; dropped from the attendance sheet.",
-                    orphan,))
+                    f"check-in in this report, so dropped from the attendance sheet.",orphan,))
         return visits
     
     #finds the earliest valid checkout timestamp for a given check-in, considering the next check-in and the remaining candidate checkouts. 
@@ -318,12 +320,43 @@ class ReportWriter:
     HEADER_FILL = PatternFill("solid", fgColor="1F4E78")
     HEADER_FONT = Font(bold=True, color="FFFFFF")
 
+    @staticmethod
+    def _shift_end_time(shift_timing: str) -> Optional[time]:
+        parts = [part.strip() for part in shift_timing.split("-")]
+        if len(parts) != 2:
+            return None
+        try:
+            return datetime.strptime(parts[1], "%I:%M %p").time()
+        except ValueError:
+            return None
+
+    @classmethod
+    def _work_date(cls, check_in: datetime, shift_timing: str) -> date:
+        parts = [part.strip() for part in shift_timing.split("-")]
+        if len(parts) != 2:
+            return check_in.date()
+        try:
+            shift_start = datetime.strptime(parts[0], "%I:%M %p").time()
+            shift_end = cls._shift_end_time(shift_timing)
+        except ValueError:
+            return check_in.date()
+
+        if shift_end is None or shift_end >= shift_start:
+            return check_in.date()
+        if check_in.time() <= shift_end:
+            return check_in.date() - timedelta(days=1)
+        return check_in.date()
+
     @classmethod
     def write(cls, visits: list[VisitRecord], audit: list[AuditEntry], output_path: Path) -> None:
         attendance_df = pd.DataFrame([v.as_row() for v in visits], columns=OUTPUT_COLUMNS)
         audit_df = pd.DataFrame([a.as_row() for a in audit], columns=AUDIT_COLUMNS)
 
         if not attendance_df.empty:
+            attendance_df["Date"] = attendance_df.apply(
+                lambda row: cls._work_date(row["Checked In Date"], row["Shift Timings"]).isoformat(),
+                axis=1,
+            )
             attendance_df["_employee_day_key"] = attendance_df.apply(
                 lambda row: (str(row["Employee id"]), row["Date"]), axis=1
             )
