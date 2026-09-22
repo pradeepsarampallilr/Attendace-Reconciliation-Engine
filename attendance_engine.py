@@ -126,9 +126,15 @@ class AttendanceEngine:
     MAX_HEADER_SCAN_ROWS = 15 #how many rows to scan for the header row in the movement report
     MAX_SHIFT_HOURS = 18 #taken for the maximum number of hours allowed in a single check-in/check-out session
 
-    def __init__(self, movement_path: Path, shift_path: Optional[Path] = None):
+    def __init__(
+        self,
+        movement_path: Path,
+        shift_path: Optional[Path] = None,
+        previous_movement_path: Optional[Path] = None,
+    ):
         self.movement_path = Path(movement_path)
         self.shift_path = Path(shift_path) if shift_path else None
+        self.previous_movement_path = (Path(previous_movement_path) if previous_movement_path else None)
         self.shift_lookup: dict[str, ShiftRecord] = {}
         self.audit: list[AuditEntry] = []
         self._reported_missing_roster: set[str] = set()
@@ -138,14 +144,41 @@ class AttendanceEngine:
             self.shift_lookup = self._load_shift_roster(self.shift_path)
         header, data = self._load_movement_table(self.movement_path)
         events = self._extract_events(header, data)
+        current_dates = [timestamp for _, (_, ins, outs) in events.items() for timestamp in (*ins, *outs)]
+
+        if self.previous_movement_path:
+            previous_header, previous_data = self._load_movement_table(self.previous_movement_path)
+            previous_last_date = self._last_transaction_date(previous_header, previous_data)
+            previous_events = self._extract_events(previous_header, previous_data, {previous_last_date}) if previous_last_date else {}
+            events = self._merge_event_pools(previous_events, events)
 
         visits: list[VisitRecord] = []
         for emp_code, (name, ins, outs) in events.items():
             visits.extend(self._reconcile_employee(emp_code, name, ins, outs))
 
+        if self.previous_movement_path and current_dates:
+            current_start = min(current_dates).date().replace(day=1)
+            next_month = (current_start.replace(year=current_start.year + 1, month=1)if current_start.month == 12 else current_start.replace(month=current_start.month + 1))
+            visits = [visit for visit in visits if current_start <= visit.check_in.date() < next_month
+                or (visit.check_out is not None and current_start <= visit.check_out.date() < next_month)]
+
         self._enrich_with_roster(visits)
         visits.sort(key=lambda v: (v.name.lower(), v.check_in))
         return visits, self.audit
+
+    @staticmethod
+    def _merge_event_pools(first: dict[str, tuple[str, list[datetime], list[datetime]]],
+        second: dict[str, tuple[str, list[datetime], list[datetime]]],) -> dict[str, tuple[str, list[datetime], list[datetime]]]:
+        merged: dict[str, tuple[str, set[datetime], set[datetime]]] = {}
+        for source in (first, second):
+            for emp_code, (name, ins, outs) in source.items():
+                current_name, current_ins, current_outs = merged.setdefault(emp_code, (name, set(), set()))
+                if name and not current_name:
+                    current_name = name
+                current_ins.update(ins)
+                current_outs.update(outs)
+                merged[emp_code] = (current_name, current_ins, current_outs)
+        return {emp_code: (name or emp_code, sorted(ins), sorted(outs)) for emp_code, (name, ins, outs) in merged.items()}
 
     # since the monthly movement report can have multiple rows with heading and actual rows 
     # are at different levels we are extracing exact row numner!!
@@ -175,9 +208,29 @@ class AttendanceEngine:
         data = raw.iloc[header_row + 1 :].reset_index(drop=True)
         return header, data
 
+    @staticmethod
+    def _last_transaction_date(header: list[str], data: pd.DataFrame) -> Optional[date]:
+        lower_header = [item.lower() for item in header]
+        date_index = next(
+            (lower_header.index(name) for name in ("transdate", "date") if name in lower_header),
+            None,
+        )
+        if date_index is None:
+            return None
+        dates = [
+            parsed
+            for value in data.iloc[:, date_index]
+            if (parsed := parse_date(value)) is not None
+        ]
+        return max(dates) if dates else None
+
     # generate a dictionary of employee id -> (name, list of check-ins, list of check-outs) from the movement report
-    def _extract_events(self, header: list[str], data: pd.DataFrame) -> dict[str, 
-        tuple[str, list[datetime], list[datetime]]]:
+    def _extract_events(
+        self,
+        header: list[str],
+        data: pd.DataFrame,
+        allowed_dates: Optional[set[date]] = None,
+    ) -> dict[str, tuple[str, list[datetime], list[datetime]]]:
         # convert all header names to lowercase for case-insensitive matching
         lower_header = [h.lower() for h in header]
 
@@ -205,6 +258,8 @@ class AttendanceEngine:
             trans_date = parse_date(row.iloc[col_date]) if col_date < len(row) else None
             if trans_date is None:
                 self.audit.append(AuditEntry(emp_code, name, "Unparsable row","TransDate could not be parsed; row skipped."))
+                continue
+            if allowed_dates is not None and trans_date not in allowed_dates:
                 continue
 
             # for each employee, we maintain a pool of their check-in and check-out timestamps. 
@@ -481,11 +536,15 @@ def main() -> None:
 
     # check-in / check-out report and shift roster
     movement_path = _prompt_path("\nPath to this month's check-in / check-out report (.xlsx or .csv): ",required=True,)
+    previous_movement_path = _prompt_path(
+        "Path to last month's check-in / check-out report (optional, press Enter to skip): ",
+        required=False,
+    )
     # shift roster is optional, so we allow the user to skip it by pressing Enter
     shift_path = _prompt_path("Path to the shift roster file (optional, press Enter to skip): ",required=False,)
 
     # run the engine and get the visits and audit log
-    engine = AttendanceEngine(movement_path, shift_path)
+    engine = AttendanceEngine(movement_path, shift_path, previous_movement_path)
     visits, audit = engine.run()
 
     # prompt for output file name, defaulting to a name based on the first visit's check-in date or the current timestamp if no visits are found
